@@ -1,0 +1,407 @@
+#!/usr/bin/env python3
+
+import unittest
+import argparse
+import urllib.request # (python3) we use the standard library as we do not want to install 'requests'
+import json
+import sys
+import os
+import inspect
+import re
+import tempfile
+import datetime
+import subprocess
+import shutil
+
+import email
+import email.encoders
+import email.mime.base
+import email.mime.multipart
+import email.mime.text
+
+import smtplib
+import ssl
+
+# =======================================
+# verbosity, logs functions
+# =======================================
+
+DO_DEBUG=False # this is the only global variable, we use it as we do not want to pass the CLI options
+
+def print_with_function_name(*args, sep=' ', end='\n'):
+    thestack=inspect.stack()
+    lenthestack=len(thestack)
+    funtionnameat=2
+    funtionname=thestack[funtionnameat].function
+    filename=thestack[funtionnameat].filename
+    print(funtionname+"(): ",end='')
+    print(*args, sep=sep, end=end)
+    
+def prunt(*args, sep=' ', end='\n'):
+    """
+    Just like python print(), outputs to console the args, but with the calling function name
+    """
+    print_with_function_name(*args, sep=' ', end=end)
+    
+def debug(*args, sep=' ', end='\n'):
+    """
+    If debugging is enabled, outputs to console the args, with the calling function name
+    """
+    if DO_DEBUG: 
+        print_with_function_name(*args, sep=' ', end=end)
+
+def timer():
+    time1=datetime.datetime.now()
+    return time1
+
+# =======================================
+# configuration functions
+# =======================================
+
+def get_envkey(key,opts,doask=False):
+    """
+    Tries to find a value for key, in that order:
+    1) in the CLI options
+    2) in the env
+    3) ask for it interactively
+    """
+    debug("looking at key",key)
+    optsdic=vars(opts) # see https://stackoverflow.com/questions/16878315/what-is-the-right-way-to-treat-python-argparse-namespace-as-a-dictionary
+
+    debug("optsdic.keys()",optsdic.keys())
+    debug("optsdic",json.dumps(optsdic,indent=4))
+    envkey="CLOC_"+key.upper()
+
+    if key in optsdic.keys():
+        if isinstance(optsdic[key],bool):
+            debug("key",key,"is boolean")
+            value=optsdic[key]
+            if envkey in os.environ.keys():
+                value=True
+        else:
+            debug("key",key,"is not boolean")
+            value=optsdic[key]
+            if not value:
+                if envkey in os.environ.keys():
+                    value=os.environ[envkey]
+                elif doask:
+                    debug("I could not find a value for",key)
+                    value = input("Enter a value for '"+str(key)+"' and press enter: ")
+                else:
+                    value=''
+    debug("returning",value)
+    return value
+
+def get_mailto(opts):
+    key="mailto"
+    return get_envkey(key,opts,doask=True) 
+
+def get_mailfrom_username(opts):
+    key="mailfrom_username"
+    return get_envkey(key,opts,doask=True)
+
+def get_mailfrom_password(opts):
+    key="mailfrom_password"
+    return get_envkey(key,opts,doask=True)
+
+
+# =======================================
+# MAIN SCRIPT LOGICS
+# =======================================
+
+def get_repo_info(repostring):
+    """
+    Returns a couple (owner,repo) from a string.
+    """
+    prunt("inspecting",repostring)
+    pattern="^(github.com/|git@github.com:|https://api.github.com/repos/|https://github.com/|/|)([^/]+)/([^/\.]+)"
+    regex=re.compile(pattern)
+    matches=regex.match(repostring)
+    if matches:
+        debug("MATCHES",matches)
+        m=list(matches.groups())
+        debug("m",m)
+    else:
+        prunt("nomatch")
+        prunt("Sorry, I could not extract the OWNER and REPOSITORY from the github string",repostring)
+        quit()
+    (owner,repo)=tuple(m[1:])
+    debug("returning (owner,repo)",(owner,repo))
+    return (owner,repo)
+
+# =======================================
+# unit testing classes
+# =======================================
+
+class TestInscript(unittest.TestCase):
+    def test_repo(self):
+        inputs=(
+            ('https://github.com/alexmadon/saml_wsgi', ('alexmadon', 'saml_wsgi')),
+            ('git@github.com:alexmadon/saml_wsgi.git', ('alexmadon', 'saml_wsgi')),
+            ('https://github.com/alexmadon/saml_wsgi.git', ('alexmadon', 'saml_wsgi')),
+            ('https://github.com/alexmadon/saml_wsgi/archive/refs/heads/master.zip', ('alexmadon', 'saml_wsgi')),
+            ('https://github.com/AlDanial/cloc', ('AlDanial', 'cloc')),
+            ('/AlDanial/cloc', ('AlDanial', 'cloc')),
+            ('AlDanial/cloc', ('AlDanial', 'cloc')),
+            ('https://github.com/AlDanial/cloc/tree/dev', ('AlDanial', 'cloc')),
+            ('/AlDanial/cloc/tree/dev', ('AlDanial', 'cloc')),
+            ('/AlDanial/cloc/dev', ('AlDanial', 'cloc')),
+            ('https://api.github.com/repos/AlDanial/cloc', ('AlDanial', 'cloc')),
+            ('github.com/AlDanial/cloc', ('AlDanial', 'cloc')),
+        )
+        for (ainput,expected) in inputs:
+            calculated=get_repo_info(ainput)
+            prunt((ainput,calculated))
+            self.assertEqual(expected, calculated)
+
+
+# =======================================
+# mail functions
+# =======================================
+
+def get_maildetails(report_filename,opts):
+
+    prunt("forging message")
+    sender_email=get_mailfrom_username(opts)
+    receiver_email=get_mailto(opts)
+    
+    message = email.mime.multipart.MIMEMultipart()
+    message["From"] = sender_email
+    message["To"] = receiver_email
+    message["Subject"] = "Your cloc report for "+opts.githubrepo[0]
+    body=[]
+    body.append("Dear "+receiver_email)
+    body.append("A CLOC report has been run again repository:")
+    body.append(opts.githubrepo[0])
+    body.append("Please find it as attachment,")
+    body.append("Kind regards,")
+    body.append(sender_email)
+
+    message.attach(email.mime.text.MIMEText('\n'.join(body), "plain"))
+    
+    with open(report_filename, "rb") as attachment:
+        part = email.mime.base.MIMEBase("text","plain")
+        part.set_payload(attachment.read())
+        
+    email.encoders.encode_base64(part)
+    
+    part.add_header(
+        "Content-Disposition",
+        "attachment; filename=report.txt",
+    )
+    
+    # Add attachment to message and convert message to string
+    message.attach(part)
+    text = message.as_string()
+    prunt("(sender_email, receiver_email)",(sender_email, receiver_email))
+    return (sender_email, receiver_email, text)
+
+def send_report(report_filename,opts):
+    # see https://realpython.com/python-send-email/
+    (sender_email, receiver_email, text)=get_maildetails(report_filename,opts)
+    
+    context = ssl.create_default_context()
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context) as server:
+        server.login(get_mailfrom_username(opts), get_mailfrom_password(opts))
+        server.sendmail(sender_email, receiver_email, text)
+        
+def forge_zipurl(owner,repo):
+    """
+    Returns the archive URL we will download
+    """
+    # this is called archive_url in github API "archive_url": "https://api.github.com/repos/alexmadon/saml_wsgi/{archive_format}{/ref}",
+    # see https://stackoverflow.com/questions/8377081/github-api-download-zip-or-tarball-link
+    # examples:
+    #    https://api.github.com/repos/alexmadon/saml_wsgi/zipball
+    #    https://api.github.com/repos/alexmadon/saml_wsgi/zipball/master
+    #    https://api.github.com/repos/alexmadon/saml_wsgi/tarball
+    zipurl="https://api.github.com/repos/"+owner+"/"+repo+"/zipball"
+    prunt("zipurl",zipurl)
+    return zipurl
+
+def forge_zipfilename(owner,repo,opts):
+     tempdir=tempfile.gettempdir()
+     zipfilename=tempdir+"/"+owner+"_"+repo+".zip"
+     prunt("zipfilename",zipfilename)
+     return zipfilename
+ 
+def forge_zipfilename_raw(repostring):
+    """
+    Sanitize a repo raw URL
+    """
+    tempdir=tempfile.gettempdir()
+    pattern="[:\/]"
+    regex=re.compile(pattern)
+    cleaned=regex.sub("_",repostring)
+    zipfilename=tempdir+"/"+cleaned
+    prunt("zipfilename",zipfilename)
+    return zipfilename
+
+def get_locations(opts):
+    """
+    Returns the zip to download and the filename to save it into.
+    """
+    repostring=opts.githubrepo[0]
+    prunt("using repostring",repostring)
+    if opts.raw:
+        prunt("using raw URL",repostring)
+        zip_url=repostring
+        zip_filename=forge_zipfilename_raw(repostring)
+    else:
+        (owner,repo)=get_repo_info(repostring)
+        zip_url=forge_zipurl(owner,repo)
+        zip_filename=forge_zipfilename(owner,repo,opts)
+    return (zip_url,zip_filename)
+
+def dump_repo2disk(opts):
+    """
+    Get the repo and stream it to our disk
+    """
+    (zip_url,zip_filename)=get_locations(opts)
+
+    if opts.cache:
+        prunt("using repository in cache at",zip_filename)
+    else:
+        # see:
+        # https://stackoverflow.com/questions/9419162/download-returned-zip-file-from-url
+        # https://stackoverflow.com/questions/1517616/stream-large-binary-files-with-urllib2-to-file
+        prunt("starting dumping",zip_url,"to",zip_filename)
+        time1=timer()
+        
+        # we assume URL/repo is public
+        # TODO: support bearers https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/creating-a-personal-access-token
+        req = urllib.request.Request(url=zip_url)
+        
+        CHUNK = 16 * 1024
+        with urllib.request.urlopen(req) as r:
+            with open(zip_filename, 'wb') as w:
+                while True:
+                    chunk = r.read(CHUNK)
+                    if not chunk:
+                        break
+                    w.write(chunk)
+        time2=timer()
+        prunt("finished dumping",zip_url,"to",zip_filename,"(took",time2-time1,")")
+    return zip_filename
+
+
+def execute_command_show(command):
+    """
+    Runs a command displaying its output as it progresses (no buffering)
+    """
+    # https://stackoverflow.com/questions/4417546/constantly-print-subprocess-output-while-process-is-running
+    prunt("executing command:",command)
+    with subprocess.Popen(command, stdout=subprocess.PIPE,bufsize=1, universal_newlines=True) as p:
+        lines=[]
+        for line in p.stdout:
+            print(line, end='') # process line here
+            lines.append(line)
+    if p.returncode != 0:
+        prunt("error",(p.returncode, p.args))
+
+def get_cloc_executable(opts):
+    """
+    Looks for the CLOC executable location, depending on the configuration
+    """
+    prunt("checking if you set a specific cloc executable in env or args")
+    key="command"
+    cloc_executable=get_envkey(key,opts,doask=False)
+    if cloc_executable=='':
+        prunt("cloc path not set, searching for default using 'which'")
+        # https://stackoverflow.com/questions/11210104/check-if-a-program-exists-from-a-python-script
+        cloc_executable=shutil.which("cloc")
+        prunt("which cloc_executable",cloc_executable)
+        if not cloc_executable:
+            prunt("ERROR: Could not find cloc executable!")
+            quit()
+    else:
+        prunt("cloc_executable from env:",cloc_executable)
+
+    prunt("using cloc executable at",cloc_executable)
+    return cloc_executable
+
+def get_report_filename(opts):
+    tempdir=tempfile.gettempdir()
+    report_filename=tempdir+"/report.txt"
+    prunt("using report_filename:",report_filename)
+    return report_filename
+
+def do_clocfile(zip_filename,opts):
+    """
+    Runs a CLOC report
+    """
+    # https://github.com/AlDanial/cloc/issues/510 "Undefined subroutine &main::Raku_or_Prolog called at /usr/bin/cloc line 5557."
+    # cloc --version 1.86
+    # https://github.com/AlDanial/cloc/releases/download/v1.92/cloc-1.92.tar.gz
+    # Github link : https://github.com/AlDanial/cloc/releases/latest
+    # https://github.com/AlDanial/cloc/releases/download/v1.92/cloc-1.92.pl
+    report_filename=get_report_filename(opts)
+
+    if opts.cache:
+        prunt("getting report from cache at",report_filename)
+    else:
+        cloc_executable=get_cloc_executable(opts)
+        command=[
+            cloc_executable,
+            '--report-file',report_filename,
+            zip_filename,
+        ]
+        execute_command_show(command)
+        
+    return report_filename
+
+# =======================================
+# main and CLI args parsing
+# =======================================
+
+def main(opts):
+    if len(opts.githubrepo)!=1:
+        prunt("We expect exacty one github repo")
+        quit()
+    zip_filename=dump_repo2disk(opts)
+    report_filename=do_clocfile(zip_filename,opts)
+    send_report(report_filename,opts)
+    
+def parse_cli():
+    
+    parser = argparse.ArgumentParser(description="""
+This script scans a specified GitHub source repository with CLOC and send the
+output of CLOC to an email address specified.
+
+Example usage:
+
+cloc_git2mail --mailto alex.madon@gmail.com https://github.com/AlDanial/cloc
+cloc_git2mail --mailto alex.madon@gmail.com github.com/AlDanial/cloc
+cloc_git2mail --mailto alex.madon@gmail.com AlDanial/cloc
+cloc_git2mail AlDanial/cloc
+
+Requirements:
+
+You need to have cloc installed, see http://cloc.sourceforge.net/ or https://github.com/AlDanial/cloc
+
+
+""",formatter_class=argparse.RawTextHelpFormatter)
+    parser.add_argument('githubrepo', help="The github repo to look at",nargs='*')
+    parser.add_argument('-d','--debug', help="Activate debugging. Takes precedence over CLOCC_DEBUG",action="store_true")
+    parser.add_argument('-c','--cache', help="Get from cache",action="store_true")
+    parser.add_argument('-r','--raw', help="If set, then the repo string is taken as the URL to download",action="store_true")
+    parser.add_argument('-k','--command', help="The 'cloc' perl executable location",type=str)
+    parser.add_argument('-m','--mailto', help="The email address to send the report to. Default is value of env var CLOC_MAILTO",type=str)
+    parser.add_argument('-f','--mailfrom-username', help="The google login used to send mail",type=str)
+    parser.add_argument('-p','--mailfrom-password', help="The google password used to send mail",type=str)
+
+
+    parser.add_argument('-t','--test', help="Run the unit tests",action="store_true")
+    opts = parser.parse_args()
+    return opts
+
+
+if __name__ == "__main__":
+    opts=parse_cli()
+    DO_DEBUG=get_envkey("debug",opts)
+    if opts.test:
+        prunt("# =============== RUNNING UNIT TESTS =============")
+        sys.argv=[sys.argv[0],"-v"]  # do not pass the args, reset them
+        unittest.main()
+    else:
+        main(opts)
