@@ -114,7 +114,7 @@ def get_repo_info(repostring):
     Returns a couple (owner,repo) from a string.
     """
     prunt("inspecting",repostring)
-    pattern="^(github.com/|git@github.com:|https://api.github.com/repos/|https://github.com/|/|)([^/]+)/([^/\.]+)"
+    pattern="^(github.com/|git@github.com:|https://api.github.com/repos/|https://github.com/|/|)([^/]+)/([^/]+)"
     regex=re.compile(pattern)
     matches=regex.match(repostring)
     if matches:
@@ -127,6 +127,9 @@ def get_repo_info(repostring):
         quit()
     (owner,repo)=tuple(m[1:])
     debug("returning (owner,repo)",(owner,repo))
+    if repo.endswith('.git'):
+        debug("repo endswith .git, truncating")
+        repo=repo[:-4]
     return (owner,repo)
 
 # =======================================
@@ -148,6 +151,7 @@ class TestInscript(unittest.TestCase):
             ('/AlDanial/cloc/dev', ('AlDanial', 'cloc')),
             ('https://api.github.com/repos/AlDanial/cloc', ('AlDanial', 'cloc')),
             ('github.com/AlDanial/cloc', ('AlDanial', 'cloc')),
+            ('https://github.com/impress/impress.js', ('impress', 'impress.js')),
         )
         for (ainput,expected) in inputs:
             calculated=get_repo_info(ainput)
@@ -258,6 +262,8 @@ def dump_repo2disk(opts):
     Get the repo and stream it to our disk
     """
     (zip_url,zip_filename)=get_locations(opts)
+    debug("zip_url",zip_url)
+    debug("zip_filename",zip_filename)
 
     if opts.cache:
         prunt("using repository in cache at",zip_filename)
@@ -274,12 +280,17 @@ def dump_repo2disk(opts):
         
         CHUNK = 16 * 1024
         with urllib.request.urlopen(req) as r:
+            debug("Content-Length",r.getheader('Content-Length')) # sometimes NOT set
+            debug("r.headers",r.headers)
+            debug("r.info()",r.info())
             with open(zip_filename, 'wb') as w:
                 while True:
                     chunk = r.read(CHUNK)
+                    print('.',end='', flush=True) # basic progressbar https://stackoverflow.com/questions/230751/how-can-i-flush-the-output-of-the-print-function-unbuffer-python-output
                     if not chunk:
                         break
                     w.write(chunk)
+        print()
         time2=timer()
         prunt("finished dumping",zip_url,"to",zip_filename,"(took",time2-time1,")")
     return zip_filename
@@ -374,6 +385,7 @@ cloc_git2mail --mailto alex.madon@gmail.com https://github.com/AlDanial/cloc
 cloc_git2mail --mailto alex.madon@gmail.com github.com/AlDanial/cloc
 cloc_git2mail --mailto alex.madon@gmail.com AlDanial/cloc
 cloc_git2mail AlDanial/cloc
+cloc_git2mail https://github.com/impress/impress.js
 
 Requirements:
 
